@@ -78,7 +78,7 @@ EOF
     # verify CSR has been created
     set +e
     while true; do
-        if kubectl get csr ${csr_name} 2>/dev/null; then
+        if kubectl get csr ${CSR_NAME} 2>/dev/null; then
             break
         fi
     done
@@ -166,7 +166,7 @@ main() {
     done
 
     if [ -z "${SERVICE}" ]; then
-        echo "Service name and namespace is required"
+        echo "Service name is required"
         usage
         exit 1
     fi
