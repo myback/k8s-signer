@@ -175,7 +175,7 @@ main() {
     ALL_CN+="${SERVICE}.${NAMESPACE},"
     ALL_CN+="${SERVICE}.${NAMESPACE}.svc"
 
-    if [ ! -f "${DIR}" ]; then
+    if [ ! -d "${DIR}" ]; then
         mkdir -p "${DIR}"
     fi
 
