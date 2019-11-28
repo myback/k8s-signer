@@ -17,7 +17,7 @@
 set -eo pipefail
 
 usage() {
-    cat <<EOF
+    echo -e "
 This script generates a certificate suitable for use with the webhook
 admission controller, either self-signed or signed by the k8s CA via the 
 CertificateSigningRequest API.
@@ -25,11 +25,15 @@ NOTE: USE SELF-SIGNED CERTIFICATE FOR DEMO PURPOSES ONLY. IN PRODUCTION WORKLOAD
 
 usage: $0 [OPTIONS]
 The following flags are required.
-        -o, --out-dir           Path to save certificates.
-        -n, --namespace         Namespace name.
-        -s, --service-name      Service name.
-        -S, --sign              Create self-signed certificate.
-EOF
+        -d, --crt-days          Number of days valid certifficate. For use with self-signed certificates. Default 365.
+        -D, --ca-days           Number of days valid CA certificate. For use with self-signed certificates. Default 3650.
+        -o, --out-dir           Path to save keys and certificates. Default \"./pki\"
+        -n, --namespace         Namespace name. Use for automatic generate DNS. Default \"default\"
+        -s, --service-name      Service name. \033[31mRequired\033[0m. Use only k8s service name. Automatic generate DNS with .{namespace} and .{namespace}.svc
+        -S, --sign              Create self-signed certificate. If you use this option you can set --service-name with multiple FQDN, separated by commas.
+        -u, --subj              Subject for certificate. Used ca-cubj if not set.
+        -U, --ca-subj           Subject for CA certificate. \033[31mRequired\033[0m.
+"
 }
 
 ssl::generate::key() {
@@ -41,15 +45,25 @@ ssl::generate::key() {
 
 ssl::generate::request() {
     local TLS_PATH=${1}
+    local SUBJECT=${2}
 
-    openssl req -new -key "${TLS_PATH}/server.key" -out "${TLS_PATH}/server.csr" -config "${TLS_PATH}/ssl.conf" -subj "/C=RU/O=MyBack.space/OU=k8s"
+    openssl req -new -key "${TLS_PATH}/server.key" -out "${TLS_PATH}/server.csr" \
+            -config "${TLS_PATH}/ssl.conf" -subj "${SUBJECT}"
 }
 
 ssl::signed::self() {
     local TLS_PATH=${1}
+    local CA_DAYS=${2}
+    local CRT_DAYS=${3}
+    local SUBJECT=${4}
 
-    openssl req -new -x509 -nodes -days 3650 -keyout "${TLS_PATH}/ca.key" -out "${TLS_PATH}/ca.crt" -config "${TLS_PATH}/ssl.conf" -subj "/C=RU/O=MyBack.space/OU=k8s"
-    openssl x509 -days 730 -req -in "${TLS_PATH}/server.csr" -CA "${TLS_PATH}/ca.crt" -CAkey "${TLS_PATH}/ca.key" -CAcreateserial -out "${TLS_PATH}/server.crt"
+    openssl req -new -x509 -nodes -days ${CA_DAYS} -keyout "${TLS_PATH}/ca.key" \
+            -out "${TLS_PATH}/ca.crt" -config "${TLS_PATH}/ssl.conf" \
+            -subj "${SUBJECT}"
+
+    openssl x509 -days ${CRT_DAYS} -req -in "${TLS_PATH}/server.csr" -CA "${TLS_PATH}/ca.crt" \
+            -CAkey "${TLS_PATH}/ca.key" -CAcreateserial -CAserial "${TLS_PATH}/crt.srl" -out "${TLS_PATH}/server.crt" \
+            -extensions v3_req -extfile "${TLS_PATH}/ssl.conf"
 }
 
 ssl::signed::k8s() {
@@ -88,6 +102,7 @@ EOF
     # verify certificate has been signed
     for _ in $(seq 10); do
         ssl_crt=$(kubectl get csr "${CSR_NAME}" -o jsonpath='{.status.certificate}')
+
         if [ -n "${ssl_crt}" ]; then
             break
         fi
@@ -112,8 +127,15 @@ req_extensions = v3_req
 distinguished_name = req_distinguished_name
 
 [req_distinguished_name]
+;C=Country
+;ST=State
+;L=Location
+;O=Organization
+;OU=Organizational Unit
+;CN=Common Name
+;emailAddress=admin@example.com
 
-[ v3_req ]
+[v3_req]
 basicConstraints = CA:FALSE
 keyUsage = nonRepudiation, digitalSignature, keyEncipherment
 extendedKeyUsage = serverAuth
@@ -130,22 +152,36 @@ EOF
 }
 
 main() {
-    local DIR='.'
-    local SIGN_TYPE='1'
+    # Required options
     local SERVICE=''
-    local NAMESPACE='default'
+    local CA_SUBJ=''
+    # ----------------
 
-    while getopts 'h:n:o:s:S-:' opt; do
+    local DIR='./pki'
+    local SIGN_TYPE='1'
+    local NAMESPACE='default'
+    local CA_DAYS=3650
+    local CRT_DAYS=365
+    local CRT_SUBJ=''
+
+    while getopts 'd:D:h:n:o:s:Su:U:-:' opt; do
         case ${opt} in
+            d) CRT_DAYS="${OPTARG}" ;;
+            D) CA_DAYS="${OPTARG}" ;;
             n) NAMESPACE="${OPTARG}" ;;
             o) DIR="${OPTARG}" ;;
             s) SERVICE="${OPTARG}" ;;
             S) SIGN_TYPE='2' ;;
+            u) CRT_SUBJ="${OPTARG}" ;;
+            U) CA_SUBJ="${OPTARG}" ;;
             h) usage
                exit 0
                ;;
             -) LONG_OPTARG="${OPTARG#*=}"
                 case $OPTARG in
+                    ca-days) CA_DAYS="${OPTARG}" ;;
+                    ca-subj) CA_SUBJ="${OPTARG}" ;;
+                    crt-days) CRT_DAYS="${OPTARG}" ;;
                     namespace) NAMESPACE="${OPTARG}" ;;
                     help) usage
                           exit 0
@@ -153,6 +189,7 @@ main() {
                     out-dir) DIR="${OPTARG}" ;;
                     service-name) SERVICE="${OPTARG}" ;;
                     sign) SIGN_TYPE='2' ;;
+                    subj) CRT_SUBJ="${OPTARG}" ;;
                     *) echo "Unknown option -- ${OPTARG}"
                        usage
                        exit 1
@@ -171,9 +208,24 @@ main() {
         exit 1
     fi
 
-    local ALL_CN="${SERVICE},"
-    ALL_CN+="${SERVICE}.${NAMESPACE},"
-    ALL_CN+="${SERVICE}.${NAMESPACE}.svc"
+    if [ -z "${CA_SUBJ}" ]; then
+        echo "CA subject is required"
+        usage
+        exit 1
+    fi
+
+    if [ -z "${CRT_SUBJ}" ]; then
+        CRT_SUBJ="${CA_SUBJ}"
+    fi
+
+    local ALL_CN=""
+    if [ "${SIGN_TYPE}" = '2' ]; then
+        ALL_CN+="${SERVICE}"
+    else
+        ALL_CN+="${SERVICE},"
+        ALL_CN+="${SERVICE}.${NAMESPACE},"
+        ALL_CN+="${SERVICE}.${NAMESPACE}.svc"
+    fi
 
     if [ ! -d "${DIR}" ]; then
         mkdir -p "${DIR}"
@@ -181,10 +233,10 @@ main() {
 
     ssl::generate::conf "${DIR}" "${ALL_CN}"
     ssl::generate::key "${DIR}"
-    ssl::generate::request "${DIR}"
+    ssl::generate::request "${DIR}" "${CA_SUBJ}"
 
-    if [[ "${SIGN_TYPE}" = '2' ]]; then
-        ssl::signed::self "${DIR}"
+    if [ "${SIGN_TYPE}" = '2' ]; then
+        ssl::signed::self "${DIR}" ${CA_DAYS} ${CRT_DAYS} "${CRT_SUBJ}"
     else
         ssl::signed::k8s "${DIR}" "${SERVICE}.${NAMESPACE}"
     fi
